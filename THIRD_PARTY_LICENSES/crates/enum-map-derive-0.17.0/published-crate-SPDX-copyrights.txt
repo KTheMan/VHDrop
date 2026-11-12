@@ -1,0 +1,11 @@
+Copyright notices transcribed from published crate source file headers:
+README.md: 2022 Kamila Borowska <kamila@borowska.pw>
+src/derive_enum.rs: 2021 - 2023 Kamila Borowska <kamila@borowska.pw>
+src/derive_enum.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/derive_struct.rs: 2021 - 2022 Kamila Borowska <kamila@borowska.pw>
+src/derive_struct.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/lib.rs: 2017 - 2022 Kamila Borowska <kamila@borowska.pw>
+src/lib.rs: 2018 hcpl <hcpl.prog@gmail.com>
+src/lib.rs: 2019 mara <vmedea@protonmail.com>
+src/lib.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/lib.rs: 2021 Dietrich <dietrich@teilgedanken.de>

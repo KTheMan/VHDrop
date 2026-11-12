@@ -1,0 +1,32 @@
+Copyright notices transcribed from published crate source file headers:
+CHANGELOG.md: 2018 - 2023 Kamila Borowska <kamila@borowska.pw>
+CHANGELOG.md: 2021 Alex Sayers <alex@asayers.com>
+README.md: 2017 - 2023 Kamila Borowska <kamila@borowska.pw>
+src/arbitrary.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/arbitrary.rs: 2021 Kamila Borowska <kamila@borowska.pw>
+src/enum_map_impls.rs: 2017 - 2021 Kamila Borowska <kamila@borowska.pw>
+src/enum_map_impls.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/enum_map_impls.rs: 2021 micycle
+src/enum_map_impls.rs: 2023 Nicolas Carranza <nicarran@yandex.com>
+src/internal.rs: 2017 - 2023 Kamila Borowska <kamila@borowska.pw>
+src/internal.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/internal.rs: 2022 philipp <descpl@yahoo.de>
+src/iter.rs: 2017 - 2022 Kamila Borowska <kamila@borowska.pw>
+src/iter.rs: 2020 Amanieu d'Antras <amanieu@gmail.com>
+src/iter.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/lib.rs: 2017 - 2023 Kamila Borowska <kamila@borowska.pw>
+src/lib.rs: 2019 Riey <creeper844@gmail.com>
+src/lib.rs: 2021 Alex Sayers <alex@asayers.com>
+src/lib.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+src/lib.rs: 2022 Cass Fridkin <cass@cloudflare.com>
+src/lib.rs: 2022 Mateusz Kowalczyk <fuuzetsu@fuuzetsu.co.uk>
+src/serde.rs: 2017 - 2023 Kamila Borowska <kamila@borowska.pw>
+src/serde.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+tests/serde.rs: 2017 - 2022 Kamila Borowska <kamila@borowska.pw>
+tests/serde.rs: 2022 Cass Fridkin <cass@cloudflare.com>
+tests/test.rs: 2018 - 2022 Kamila Borowska <kamila@borowska.pw>
+tests/test.rs: 2019 Riey <creeper844@gmail.com>
+tests/test.rs: 2020 Amanieu d'Antras <amanieu@gmail.com>
+tests/test.rs: 2021 Bruno Corrêa Zimmermann <brunoczim@gmail.com>
+tests/test.rs: 2021 micycle
+tests/test.rs: 2022 Cass Fridkin <cass@cloudflare.com>

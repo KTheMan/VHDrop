@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Copy a file or directory from a detached VHDX NTFS volume and verify each file.
+Usage: vhdx-copy IMAGE VOLUME_NUMBER /SOURCE_PATH DESTINATION_DIRECTORY
+For a directory source, merge its contents into DESTINATION_DIRECTORY.
+For a file source, copy it into DESTINATION_DIRECTORY using its original name.
+Never use while the image is attached or being written by any machine.
+Copies default streams only; does not preserve Windows ACLs, ADS, or reparse points.
+Existing files are replaced atomically; destination-only files are retained.
+"""
+import hashlib, json, os, pathlib, stat, sys, tempfile, time
+from contextlib import contextmanager
+
+
+# Copy/delete operations coordinate through a shared advisory inode lock and a
+# root-owned persistent marker. This does not exclude SMB or unrelated local writers.
+MEDIA_ROOT = None  # populated from the per-user installation config, never a built-in host path
+MARKER_PARTS = ('.vhdx-handoff', 'operations')
+
+
+def load_root(config_path=None):
+ """Load a local share root; never accept a path from an untrusted config file."""
+ path = pathlib.Path(config_path) if config_path else pathlib.Path(__file__).resolve().parent.parent / 'config.json'
+ flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+ fd = os.open(path, flags)
+ try:
+  info = os.fstat(fd)
+  if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+   raise RuntimeError('Copy helper config has unsafe ownership or permissions')
+  with os.fdopen(os.dup(fd), 'r', encoding='utf-8') as stream:
+   config = json.load(stream)
+ finally:
+  os.close(fd)
+ root = config.get('share_root') if isinstance(config, dict) else None
+ if not isinstance(root, str) or not os.path.isabs(root) or os.path.realpath(root) != root or root == '/':
+  raise RuntimeError('Copy helper share root must be a canonical absolute directory')
+ if not os.path.isdir(root): raise RuntimeError('Copy helper share root does not exist')
+ return root
+
+
+def _safe_marker_directory(root):
+ """Open trusted marker directory without following symlinks. Caller closes fd."""
+ if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
+  raise RuntimeError('Safe operation markers require Linux no-follow directory access')
+ flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+ current = os.open('/', flags)
+ try:
+  for part in root.strip('/').split('/'):
+   nxt = os.open(part, flags, dir_fd=current)
+   info = os.fstat(nxt)
+   if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+    os.close(nxt)
+    raise RuntimeError('Share ancestor is unsafe or not root-owned')
+   os.close(current)
+   current = nxt
+  root_info = os.fstat(current)
+  if root_info.st_uid != 0 or not stat.S_ISDIR(root_info.st_mode) or root_info.st_mode & 0o022:
+   raise RuntimeError('Media coordination root is unsafe or not root-owned')
+  for part in MARKER_PARTS:
+   nxt = os.open(part, flags, dir_fd=current)
+   info = os.fstat(nxt)
+   if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_dev != root_info.st_dev:
+    os.close(nxt)
+    raise RuntimeError('VHDX coordination directory is unsafe or not root-owned')
+   os.close(current)
+   current = nxt
+  return current
+ except BaseException:
+  os.close(current)
+  raise
+
+
+def _ensure_no_marker(root, image_stat):
+ """Fail closed for an incomplete/active delete or an unsafe marker directory."""
+ try:
+  marker_dir = _safe_marker_directory(root)
+ except OSError as e:
+  raise RuntimeError(f'VHDX coordination directory unavailable: {e}') from e
+ try:
+  marker_name = f'{image_stat.st_dev}-{image_stat.st_ino}.json'
+  try:
+   os.stat(marker_name, dir_fd=marker_dir, follow_symlinks=False)
+  except FileNotFoundError:
+   return
+  raise RuntimeError('An active or incomplete VHDX deletion requires recovery before copying')
+ finally:
+  os.close(marker_dir)
+
+
+@contextmanager
+def coordinated_image(image):
+ """Pin and shared-lock a local image until the caller finishes reading it."""
+ import fcntl
+ if not os.path.isabs(image): raise ValueError('Image path must be absolute')
+ root = os.path.realpath(MEDIA_ROOT)
+ path = os.path.realpath(image)
+ if os.path.commonpath((root, path)) != root or path == root:
+  raise ValueError('Image must be inside the configured share root')
+ flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+ fd = os.open(path, flags)
+ try:
+  info = os.fstat(fd)
+  if not stat.S_ISREG(info.st_mode):
+   raise RuntimeError('Image is not a regular local file')
+  try:
+   fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+  except BlockingIOError as e:
+   raise RuntimeError('VHDX is busy with another coordinated operation') from e
+  _ensure_no_marker(root, info)
+  # Dissect uses stream.name as a path; fdopen exposes an integer instead.
+  # Reopen the pinned descriptor via procfs so the stream names the same inode
+  # without resolving the original image path a second time. Keep fd locked.
+  with open(f'/proc/self/fd/{fd}', 'rb') as stream:
+   opened = os.fstat(stream.fileno())
+   if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+    raise RuntimeError('Pinned VHDX descriptor changed unexpectedly')
+   yield stream
+ finally:
+  if fd is not None: os.close(fd)
+
+
+def copy_tree(src, dest):
+ """Copy a path-like Dissect entry to an existing directory; return copy counts."""
+ if src.is_symlink(): raise ValueError('Source symlink/reparse point: '+str(src))
+ if not dest.is_dir() or dest.is_symlink(): raise ValueError('Destination must be an existing real directory')
+ files=0; total=0; dirs=0; start=time.monotonic()
+ mask=os.umask(0); os.umask(mask)
+ def check_name(name):
+  if name in ('', '.', '..') or '/' in name or '\\' in name: raise ValueError('Unsafe name: '+repr(name))
+ def copy_file(entry, target):
+  nonlocal files,total
+  check_name(entry.name)
+  if entry.is_symlink(): raise ValueError('Source symlink/reparse point: '+str(entry))
+  if target.is_symlink(): raise ValueError('Destination symlink: '+str(target))
+  if target.exists() and not target.is_file(): raise ValueError('Destination is not a regular file: '+str(target))
+  fd,tmp=tempfile.mkstemp(prefix='.vhdx-copy-',dir=target.parent)
+  try:
+   digest=hashlib.sha256(); count=0
+   with os.fdopen(fd,'wb') as out, entry.open('rb') as inp:
+    while True:
+     data=inp.read(4*1024*1024)
+     if not data: break
+     out.write(data); digest.update(data); count+=len(data)
+   st=entry.stat()
+   if count!=st.st_size: raise IOError('Size mismatch: '+str(entry))
+   verify=hashlib.sha256()
+   with open(tmp,'rb') as copied:
+    for chunk in iter(lambda: copied.read(4*1024*1024),b''): verify.update(chunk)
+   if verify.digest()!=digest.digest(): raise IOError('Hash mismatch: '+str(entry))
+   os.chmod(tmp,(target.stat().st_mode & 0o777) if target.exists() else (0o666 & ~mask))
+   os.utime(tmp,(st.st_atime,st.st_mtime)); os.replace(tmp,target)
+  finally:
+   if os.path.exists(tmp): os.unlink(tmp)
+  files+=1; total+=count
+  if files%500==0: print(f'{files} files, {total} bytes, {time.monotonic()-start:.0f}s',flush=True)
+ def walk(s,d):
+  nonlocal dirs
+  for entry in s.iterdir():
+   check_name(entry.name)
+   target=d/entry.name
+   if entry.is_symlink(): raise ValueError('Source symlink/reparse point: '+str(entry))
+   if target.is_symlink(): raise ValueError('Destination symlink: '+str(target))
+   if entry.is_dir():
+    target.mkdir(mode=0o777,exist_ok=True)
+    if not target.is_dir(): raise ValueError('Destination is not a directory: '+str(target))
+    dirs+=1; walk(entry,target)
+   elif entry.is_file(): copy_file(entry,target)
+   else: raise ValueError('Unsupported source entry: '+str(entry))
+ if src.is_dir(): walk(src,dest)
+ elif src.is_file(): copy_file(src,dest/src.name)
+ else: raise ValueError('Source must be a regular file or directory: '+str(src))
+ return files,dirs,total,time.monotonic()-start
+
+
+def main():
+ global MEDIA_ROOT
+ MEDIA_ROOT = load_root()
+ args=sys.argv[1:]
+ if args and args[0]=='--status':
+  rest=args[1:]
+  if rest and rest[0]=='--': rest=rest[1:]
+  if len(rest)!=1: sys.exit('Usage: vhdx-copy --status -- IMAGE')
+  with coordinated_image(rest[0]):
+   print('CLEAR: no app-managed deletion is active or unresolved (external users are not checked).',flush=True)
+  return
+ if len(args)!=4: sys.exit(__doc__)
+ from dissect.target import container, filesystem, volume
+ image, number, source, dest = args
+ image=os.path.realpath(image); dest=pathlib.Path(dest).absolute()
+ with coordinated_image(image) as image_file:
+  before=os.fstat(image_file.fileno())
+  disk=container.open(image_file); vs=volume.open(disk)
+  vols=[v for v in vs.volumes if v.number==int(number)]
+  if len(vols)!=1: raise ValueError('Volume number not found uniquely')
+  fs=filesystem.open(vols[0]); src=fs.path(source)
+  files,dirs,total,elapsed=copy_tree(src,dest)
+  after=os.fstat(image_file.fileno())
+  current=os.stat(image,follow_symlinks=False)
+  if ((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns) !=
+      (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns) or
+      (after.st_dev,after.st_ino)!=(current.st_dev,current.st_ino)):
+   raise RuntimeError('Image changed during copy; results may be inconsistent')
+  print(f'COMPLETE: {files} verified files, {dirs} directories, {total} bytes in {elapsed:.0f}s',flush=True)
+if __name__=='__main__': main()

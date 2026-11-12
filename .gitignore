@@ -1,0 +1,19 @@
+# Build output and local configuration
+/target/
+/.cargo-local/
+*.exe
+*.pdb
+*.dll
+*.log
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+secrets.json
+*.local.json
+.vhdx-handoff/
+# Design captures may contain personal paths or screenshots
+/qa/
+/qa-*/
+/design-qa.md

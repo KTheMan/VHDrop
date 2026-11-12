@@ -1,0 +1,4 @@
+# Helper scripts are hashed byte-for-byte by the app and the host guard.
+# Preserve their bytes on every platform, including Windows checkouts.
+server/*.py -text
+server/vhdx-copy -text
