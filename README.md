@@ -12,6 +12,10 @@ The connection setup guides you through installing the host helper.
 
 ![VHDrop connection setup](docs/screenshots/setup.png)
 
+## Download
+
+Download the Windows ZIP from [GitHub Releases](https://github.com/KTheMan/VHDrop/releases/latest). It contains the app and its license notices. Extract it before running `VHDrop.exe`.
+
 ## Requirements
 
 - Windows with OpenSSH and an SSH key that can access the storage host.
@@ -23,14 +27,16 @@ The copy helper is installed for the SSH user. It requires a canonical, root-own
 
 ## Set up the copy helper
 
-Build the Windows executable using the [build instructions](#build-and-test).
+Download the Windows ZIP above or build the executable using the [build instructions](#build-and-test).
 
-1. Run `target/release/vhdrop.exe` on Windows. Choose **Install** if you want a per-user installation, Start menu shortcut, and Explorer actions for VHD and VHDX files.
+1. Run `VHDrop.exe` on Windows, or `target/release/vhdrop.exe` if you built it yourself. Choose **Install** if you want a per-user installation, Start menu shortcut, and Explorer actions for VHD and VHDX files.
 2. Set up SSH key access and accept the host key using OpenSSH before connecting from the app.
 3. Open **Connection**. Enter your SSH address, the Windows UNC share, and the path to the same share on the Linux host. For example, `\\nas.example\share` might map to `/srv/share`.
-4. Select **Install copy helper** and then **Check copy helper**. If prompted to prepare the coordination directory, review and run the supplied command as a host administrator, then retry the installation.
+4. Select **Install copy helper**. If prompted to prepare the coordination directory, review and run the supplied command as a host administrator, then retry the installation.
 
-The app stores connection settings for your Windows user. It does not store SSH keys or passwords. Host setup downloads the copy helper's Python dependencies from PyPI, so it is not fully offline.
+The app stores connection settings for your Windows user. It does not store SSH keys or passwords. It checks the configured copy helper in the background when it starts and checks the guard when a selected image is detached. The main window shows both statuses. Use **Retry checks** if a host is temporarily unavailable. A previous successful check is not treated as proof that a helper is ready in a new session.
+
+Host setup downloads the copy helper's Python dependencies from PyPI, so it is not fully offline.
 
 ## Copy files
 
@@ -56,7 +62,7 @@ Both configurations require guest SMB with an empty password on a trusted networ
 
 The host needs system Python 3 with `cryptography`, `qemu-img`, `qemu-nbd`, `ntfs-3g`, `ntfs-3g.probe`, `ntfsinfo`, `ntfsls`, `blkid`, `modprobe`, `mount`, `umount`, `fuser`, and `sync`. Samba also needs `testparm` and `stat`. Proxmox installations need `pct` on the host. The app bundles the guard and its pinned SMB dependency wheels.
 
-To enable the guard, open **Connection**, expand **Configure host write guard**, and enter the host and share details. Review and confirm **Install bundled guard**. Select and detach an image, then choose **Verify detached image**. Verification is required for the selected image after a restart or deletion.
+To enable the guard, open **Connection**, expand **Configure host write guard**, and enter the host and share details. Review and confirm **Install bundled guard**. The app checks the guard for the selected image after detaching it and again after a successful operation. It does not trust a previous session's verification. You can retry the check if it fails.
 
 Right-click a loaded file or folder to delete it. Review the target and type `DELETE` at the second confirmation. Folder deletion is recursive and permanent. There is no Recycle Bin, and deleting files does not necessarily shrink the VHDX.
 
@@ -66,7 +72,7 @@ If cleanup reports a safe hold or unresolved marker, keep the image detached and
 
 ### Existing guard installations
 
-The guard lives at `/opt/vhdx-handoff-v1` and uses configuration at `/etc/vhdx-handoff-v1`. The installer does not overwrite existing files. If the guard is already installed, use **Verify detached image** instead of reinstalling it.
+The guard lives at `/opt/vhdx-handoff-v1` and uses configuration at `/etc/vhdx-handoff-v1`. The installer does not overwrite existing files. If the guard is already installed, let the app check it instead of reinstalling it.
 
 Some earlier builds used the same paths with different helper versions. To upgrade one of those installations, first detach every image, stop all operations, and inspect the coordination directory for active or unresolved markers. Back up and review the old installation and configuration before a host administrator removes the old versioned directories. Never remove markers to force an upgrade.
 

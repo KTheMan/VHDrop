@@ -31,6 +31,7 @@ enum Event {
     Detached(Result<String, String>),
     Log(String),
     Finished(Result<(), String>),
+    CopyHelperInvalid(u64, String),
     Installed(Result<String, String>),
     SystemTheme(bool),
     Deleted(u64, delete_ui::DeleteTarget, Result<String, String>),
@@ -38,6 +39,24 @@ enum Event {
     HostSetup(u64, Result<String, String>),
     GuardInstalled(u64, Result<String, String>),
     GuardChecked(u64, u64, String, Result<(), String>),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingHelperCheck { Copy, Guard }
+
+/// Select one passive check at a time. A queued image check must wait until
+/// active work is finished and folder discovery/process scanning has settled.
+fn next_helper_check(copy: bool, guard: bool, blocked: bool, guard_idle: bool) -> Option<PendingHelperCheck> {
+    if blocked { None }
+    else if copy { Some(PendingHelperCheck::Copy) }
+    else if guard && guard_idle { Some(PendingHelperCheck::Guard) }
+    else { None }
+}
+fn guard_check_is_current(
+    result_setup: u64, setup: u64, result_disk: u64, disk: u64,
+    detached: bool, result_image: &str, selected_image: Option<&str>,
+) -> bool {
+    result_setup == setup && result_disk == disk && detached
+        && selected_image.is_some_and(|image| image.eq_ignore_ascii_case(result_image))
 }
 struct App {
     tx: Sender<Event>,
@@ -65,6 +84,9 @@ struct App {
     config: config::Config,
     copy_ready: bool,
     setup_busy: bool,
+    setup_checking: Option<PendingHelperCheck>,
+    pending_copy_check: bool,
+    pending_guard_check: bool,
     setup_generation: u64,
     setup_message: String,
     guard_message: String,
@@ -410,14 +432,34 @@ fn apply_palette(ctx: &egui::Context, t: f32) {
 
 impl Default for App {
     fn default() -> Self {
-        let (tx, rx) = mpsc::channel();
         let (config, config_message)=match config::Config::load() {
             Ok(Some(c)) => (c, "Check the host helper before use.".to_string()),
             Ok(None) => (config::Config::default(), "Enter your host and share to begin.".to_string()),
             Err(e) => (config::Config::default(), format!("Settings could not be loaded: {e}. Existing settings will not be replaced unless you save.")),
         };
         let needs_setup=!config.copy_configured();
-        let mut a = Self {
+        let mut a = Self::from_config(config, config_message, needs_setup);
+        a.find_disks();
+        thread::spawn(refresh_mappings);
+        let tx = a.tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Event::Recent(recent::load()));
+        });
+        let tx = a.tx.clone();
+        thread::spawn(move || {
+            if let Some(v) = theme::system_light() {
+                let _ = tx.send(Event::SystemTheme(v));
+            }
+        });
+        a
+    }
+}
+impl App {
+    /// Construct state without starting background work; Default starts discovery.
+    fn from_config(config: config::Config, config_message: String, needs_setup: bool) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let pending_copy_check=config.copy_configured();
+        Self {
             tx,
             rx,
             disks: vec![],
@@ -443,6 +485,9 @@ impl Default for App {
             config,
             copy_ready: false,
             setup_busy: false,
+            setup_checking: None,
+            pending_copy_check,
+            pending_guard_check: false,
             setup_generation: 0,
             setup_message: config_message,
             guard_message: "Guard not yet checked for this image.".into(),
@@ -467,20 +512,7 @@ impl Default for App {
             brand: None,
             recent_images: vec![],
             pending_select: None,
-        };
-        a.find_disks();
-        thread::spawn(refresh_mappings);
-        let tx = a.tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(Event::Recent(recent::load()));
-        });
-        let tx = a.tx.clone();
-        thread::spawn(move || {
-            if let Some(v) = theme::system_light() {
-                let _ = tx.send(Event::SystemTheme(v));
-            }
-        });
-        a
+        }
     }
 }
 impl App {
@@ -497,6 +529,7 @@ impl App {
     fn clear_selection(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.guard_verified = None;
+        self.pending_guard_check = false;
         self.guard_message = "Guard not yet checked for this image.".into();
         self.selected = None;
         self.tree.clear();
@@ -818,10 +851,17 @@ impl App {
         });
     }
     fn start_host_setup(&mut self, install: bool) {
-        if self.setup_busy { return; }
+        self.start_host_setup_inner(install, true);
+    }
+    /// Automatic checks use the saved connection without rewriting it. Installation
+    /// remains an explicit user action and is never triggered by this path.
+    fn start_host_setup_inner(&mut self, install: bool, persist: bool) {
+        if self.setup_busy || self.busy || self.running || self.delete_running { return; }
+        self.pending_copy_check=false;
         self.copy_ready=false;
-        if let Err(e)=setup::validate(&self.config).and_then(|_|self.config.save()) {
-            self.setup_message=e;
+        let valid=setup::validate(&self.config).and_then(|_| if persist { self.config.save() } else { Ok(()) });
+        if let Err(e)=valid {
+            self.setup_message=format!("Host setup not ready: {e}");
             return;
         }
         self.setup_generation=self.setup_generation.wrapping_add(1);
@@ -829,28 +869,56 @@ impl App {
         let config=self.config.clone();
         let tx=self.tx.clone();
         self.setup_busy=true;
+        self.setup_checking=Some(PendingHelperCheck::Copy);
         self.setup_message=if install { "Installing the copy helper on the SSH host…".into() } else { "Checking the copy helper on the SSH host…".into() };
         thread::spawn(move || { let result=setup::copy_helper(&config,install);let _=tx.send(Event::HostSetup(generation,result)); });
     }
     fn start_guard_install(&mut self) {
-        if self.setup_busy {return;}
+        if self.setup_busy || self.busy || self.running || self.delete_running {return;}
         self.guard_verified=None;
         if let Err(e)=setup::validate(&self.config).and_then(|_|self.config.save()) {self.guard_message=e;return;}
         self.setup_generation=self.setup_generation.wrapping_add(1);
         let seq=self.setup_generation; let cfg=self.config.clone();let tx=self.tx.clone();
-        self.setup_busy=true;self.guard_message="Installing the bundled guard on the host…".into();
+        self.setup_busy=true;self.setup_checking=None;self.guard_message="Installing the bundled guard on the host…".into();
         thread::spawn(move || {let result=setup::install_guard(&cfg);let _=tx.send(Event::GuardInstalled(seq,result));});
     }
     fn start_guard_check(&mut self) {
-        if self.setup_busy {return;}
+        self.start_guard_check_inner(true);
+    }
+    fn start_guard_check_inner(&mut self, persist: bool) {
+        if self.setup_busy || self.busy || self.running || self.delete_running || self.scan_busy || !self.loading.is_empty() {return;}
+        self.pending_guard_check=false;
         self.guard_verified=None;
         if !self.detached {self.guard_message="Detach the selected image before verifying its host guard.".into();return;}
         let Some(image)=self.disk().map(|d|d.image_path.clone()) else {self.guard_message="Select an image first.".into();return;};
-        if let Err(e)=setup::validate(&self.config).and_then(|_|self.config.save()) {self.guard_message=e;return;}
+        let valid=setup::validate(&self.config).and_then(|_| if persist { self.config.save() } else { Ok(()) });
+        if let Err(e)=valid {self.guard_message=e;return;}
         self.setup_generation=self.setup_generation.wrapping_add(1);
         let seq=self.setup_generation;let disk_generation=self.generation;let cfg=self.config.clone();let tx=self.tx.clone();
-        self.setup_busy=true;self.guard_message="Verifying this image and host guard…".into();
+        self.setup_busy=true;self.setup_checking=Some(PendingHelperCheck::Guard);self.guard_message="Verifying this image and host guard…".into();
         thread::spawn(move || {let result=delete_job::check_guard(&cfg,&image);let _=tx.send(Event::GuardChecked(seq,disk_generation,image,result));});
+    }
+    /// Serialize passive checks so a startup copy check cannot drop a later
+    /// detached-image check. Never check a busy image or act on an unsaved draft.
+    fn run_pending_helper_checks(&mut self) {
+        let blocked=self.setup_busy || self.show_settings || self.busy || self.running || self.delete_running
+            || self.run_confirm || self.delete_dialog.is_some();
+        match next_helper_check(self.pending_copy_check, self.pending_guard_check, blocked, !self.scan_busy && self.loading.is_empty()) {
+            Some(PendingHelperCheck::Copy) => self.start_host_setup_inner(false, false),
+            Some(PendingHelperCheck::Guard) => {
+                if self.detached && self.disk().is_some() && self.config.delete_configured() {
+                    self.start_guard_check_inner(false);
+                } else {
+                    self.pending_guard_check=false;
+                }
+            },
+            None => {},
+        }
+    }
+    fn can_start_copy(&self) -> bool {
+        self.copy_ready && !self.setup_busy && !self.busy && !self.scan_busy && self.loading.is_empty()
+            && self.detached && !self.running && !self.delete_running
+            && self.disk().is_some_and(|d| command(&self.config.copy_ssh,&self.config.share,&self.config.guest_root,d,&self.source,&self.destination).is_ok())
     }
     fn run(&mut self, remote: String) {
         let t = self.tx.clone();
@@ -858,10 +926,20 @@ impl App {
         let config = self.config.clone();
         let destination = self.destination.clone();
         let image = self.disk().unwrap().image_path.clone();
+        // Invalidate any asynchronous readiness result started before this operation.
+        self.setup_generation=self.setup_generation.wrapping_add(1);
+        let setup_generation = self.setup_generation;
         self.running = true;
+        self.guard_verified = None;
+        self.pending_guard_check = false;
         self.logs.clear();
         thread::spawn(move || {
             let result = (|| -> Result<(), String> {
+                let _ = t.send(Event::Log("Checking the copy helper…".into()));
+                if let Err(error) = setup::copy_helper(&config, false) {
+                    let _ = t.send(Event::CopyHelperInvalid(setup_generation, error.clone()));
+                    return Err(error);
+                }
                 if windows::image_attached(&image)? {
                     return Err(
                         "The image was reattached in Windows; detach it again before copying."
@@ -1023,6 +1101,10 @@ impl App {
                         Ok(s) => {
                             self.detached = true;
                             self.processes.clear();
+                            if self.config.delete_configured() {
+                                self.pending_guard_check=true;
+                                self.guard_message="Waiting to verify the detached image…".into();
+                            }
                             self.status = s;
                         }
                         Err(e) => self.status = e,
@@ -1057,7 +1139,13 @@ impl App {
                     }
                     self.tree_dirty = true;
                     match result {
-                        Ok(message) => self.status = message,
+                        Ok(message) => {
+                            self.status = message;
+                            if self.detached && self.config.delete_configured() {
+                                self.pending_guard_check=true;
+                                self.guard_message="Waiting to recheck the detached image…".into();
+                            }
+                        },
                         Err(error) => {
                             self.tree.clear();
                             self.rows.clear();
@@ -1082,6 +1170,7 @@ impl App {
                 },
                 Event::HostSetup(generation, result) => {
                     self.setup_busy=false;
+                    self.setup_checking=None;
                     if generation == self.setup_generation {
                         self.copy_ready=result.is_ok();
                         self.setup_message=result.unwrap_or_else(|e| format!("Host setup not ready: {e}"));
@@ -1089,12 +1178,29 @@ impl App {
                 }
                 Event::GuardInstalled(seq, result) => {
                     self.setup_busy=false;
-                    if seq==self.setup_generation { self.guard_message=guard_install_result(result); }
+                    self.setup_checking=None;
+                    if seq==self.setup_generation {
+                        let can_verify=result.is_ok() || result.as_ref().err().is_some_and(|e|
+                            e.starts_with("VHDX_HANDOFF_GUARD_ERROR: Existing helper/configuration not overwritten; inspect it before any upgrade"));
+                        self.guard_message=guard_install_result(result);
+                        if can_verify && self.detached && self.disk().is_some() && self.config.delete_configured() {
+                            self.pending_guard_check=true;
+                        }
+                    }
                 }
                 Event::GuardChecked(seq, disk_generation, image, result) => {
                     self.setup_busy=false;
-                    if seq==self.setup_generation && disk_generation==self.generation && self.detached && self.disk().is_some_and(|d|d.image_path.eq_ignore_ascii_case(&image)) {
+                    self.setup_checking=None;
+                    if guard_check_is_current(seq,self.setup_generation,disk_generation,self.generation,
+                        self.detached && !self.busy && !self.running && !self.delete_running && !self.scan_busy && self.loading.is_empty(),
+                        &image,self.disk().map(|d|d.image_path.as_str())) {
                         match result {Ok(())=>{self.guard_verified=Some(image);self.guard_message="Guard verified for this detached image. It will be checked again before deletion.".into();},Err(e)=>{self.guard_verified=None;self.guard_message=format!("Guard is not ready: {e}");}}
+                    }
+                }
+                Event::CopyHelperInvalid(generation, error) => {
+                    if generation == self.setup_generation {
+                        self.copy_ready=false;
+                        self.setup_message=format!("Host setup not ready: {error}");
                     }
                 }
                 Event::Installed(result) => {
@@ -1104,7 +1210,13 @@ impl App {
                 Event::Finished(result) => {
                     self.running = false;
                     self.status = match result {
-                        Ok(()) => "Copy complete. The image can be reattached.".into(),
+                        Ok(()) => {
+                            if self.detached && self.config.delete_configured() {
+                                self.pending_guard_check=true;
+                                self.guard_message="Waiting to recheck the detached image…".into();
+                            }
+                            "Copy complete. The image can be reattached.".into()
+                        },
                         Err(e) => e,
                     };
                 }
@@ -1116,6 +1228,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         self.events();
+        self.run_pending_helper_checks();
         ctx.request_repaint_after(Duration::from_millis(250));
         if self.theme_mode == ThemeMode::System
             && self.system_checked.elapsed() > Duration::from_secs(10)
@@ -1484,7 +1597,36 @@ impl eframe::App for App {
       if review.clicked(){self.run_confirm=true;}
       if let Some(error)=detail {egui::CollapsingHeader::new("Connection or path details").show(ui,|ui| {ui.label(error);});}
       ui.horizontal_wrapped(|ui| { ui.label(RichText::new(icons::LOCK_SIMPLE).color(p.accent).size(16.0)); ui.label(RichText::new("Matching files are replaced; the original remains inside the VHDX image.").size(12.0)); });
-      ui.label(RichText::new("To delete from the image after detaching, first verify its host guard in Host setup.").color(p.muted).size(11.0));
+      let copy_state = if self.copy_ready { "Copy helper ready" }
+       else if self.pending_copy_check || self.setup_checking==Some(PendingHelperCheck::Copy) { "Checking copy helper…" }
+       else if !self.config.copy_configured() { "Copy helper not configured" }
+       else { "Copy helper needs attention" };
+      let guard_ready=guard_verified_for_image(self.detached,self.guard_verified.as_deref(),self.disk().map(|d|d.image_path.as_str()));
+      let guard_state = if guard_ready { "Guard verified" }
+       else if !self.config.delete_configured() { "Guard not configured" }
+       else if !self.detached { "Guard checks after detach" }
+       else if self.pending_guard_check || self.setup_checking==Some(PendingHelperCheck::Guard) { "Checking guard…" }
+       else { "Guard needs attention" };
+      ui.horizontal_wrapped(|ui| {
+       ui.label(RichText::new(copy_state).color(if self.copy_ready {p.accent} else {p.muted}).size(11.0)).on_hover_text(&self.setup_message);
+       ui.label(RichText::new("·").color(p.muted).size(11.0));
+       ui.label(RichText::new(guard_state).color(if guard_ready {p.accent} else {p.muted}).size(11.0)).on_hover_text(&self.guard_message);
+       let retry_copy=self.config.copy_configured() && !self.copy_ready && !self.pending_copy_check;
+       let retry_guard=self.detached && self.config.delete_configured() && !guard_ready && !self.pending_guard_check;
+       if (retry_copy || retry_guard) && ui.add_enabled(!self.setup_busy && !self.busy && !self.running && !self.delete_running,egui::Button::new("Retry checks")).clicked() {
+        match self.config.save() {
+         Ok(()) => { self.pending_copy_check=retry_copy; self.pending_guard_check=retry_guard; },
+         Err(e) => self.setup_message=e,
+        }
+       }
+      });
+      if (!self.copy_ready && !self.pending_copy_check && !self.setup_busy && self.config.copy_configured())
+       || (self.detached && self.config.delete_configured() && !guard_ready && !self.pending_guard_check && !self.setup_busy) {
+       egui::CollapsingHeader::new("Helper check details").show(ui,|ui| {
+        if !self.copy_ready { ui.label(&self.setup_message); }
+        if self.detached && !guard_ready { ui.label(&self.guard_message); }
+       });
+      }
       if !self.logs.is_empty(){egui::CollapsingHeader::new("Copy log").show(ui,|ui|{egui::ScrollArea::vertical().max_height(80.0).show(ui,|ui|{for line in &self.logs{ui.monospace(line);}});});}
      });});
     });
@@ -1513,14 +1655,14 @@ impl eframe::App for App {
                                     });
                                 });
                             });
-                            if self.config != old { self.copy_ready=false; self.guard_verified=None; self.setup_generation=self.setup_generation.wrapping_add(1); }
+                            if self.config != old { self.copy_ready=false; self.guard_verified=None; self.pending_copy_check=false; self.pending_guard_check=false; self.setup_generation=self.setup_generation.wrapping_add(1); }
                             let old_guard = self.config.clone();
                             ui.add_space(8.0);
                             ui.label(heading("Copy helper").size(15.0));
                             ui.label(RichText::new("Install the bundled helper, then check the connection. Installation may download Python packages and will not run sudo.").color(p.muted).size(13.0));
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add_enabled(!self.setup_busy, primary_action("Install copy helper", p)).clicked() { self.start_host_setup(true); }
-                                if ui.add_enabled(!self.setup_busy, egui::Button::new("Check copy helper")).clicked() { self.start_host_setup(false); }
+                                if ui.add_enabled(!self.setup_busy && !self.busy && !self.running && !self.delete_running, primary_action("Install copy helper", p)).clicked() { self.start_host_setup(true); }
+                                if ui.add_enabled(!self.setup_busy && !self.busy && !self.running && !self.delete_running, egui::Button::new("Check copy helper")).clicked() { self.start_host_setup(false); }
                                 if self.setup_busy { ui.spinner(); }
                             });
                             ui.label(RichText::new(&self.setup_message).color(if self.copy_ready { p.accent } else { p.muted }).size(13.0));
@@ -1551,24 +1693,31 @@ impl eframe::App for App {
                                 let verified_for_image = self.config == old_guard && guard_verified_for_image(
                                     self.detached, self.guard_verified.as_deref(), self.disk().map(|d|d.image_path.as_str()));
                                 ui.horizontal_wrapped(|ui| {
-                                    let install=ui.add_enabled(!self.setup_busy && !verified_for_image, egui::Button::new("Install bundled guard…"));
+                                    let install=ui.add_enabled(!self.setup_busy && !self.busy && !self.running && !self.delete_running && !verified_for_image, egui::Button::new("Install bundled guard…"));
                                     let install=if verified_for_image { install.on_disabled_hover_text("The guard is already verified for this image; no reinstall is needed.") } else { install };
                                     if install.clicked() { self.guard_install_confirm=true; }
-                                    if ui.add_enabled(!self.setup_busy && self.detached && self.selected.is_some(), egui::Button::new("Verify detached image")).clicked() { self.start_guard_check(); }
+                                    if ui.add_enabled(!self.setup_busy && !self.busy && !self.running && !self.delete_running && !self.scan_busy && self.loading.is_empty() && self.detached && self.selected.is_some(), egui::Button::new("Verify detached image")).clicked() { self.start_guard_check(); }
                                     if self.setup_busy { ui.spinner(); }
                                 });
                                 if verified_for_image { ui.label(RichText::new("Guard verified for this image; no reinstall is needed.").color(p.accent).size(13.0)); }
                                 else { ui.label(RichText::new(&self.guard_message).color(p.muted).size(13.0)); }
                                 ui.weak("Other network locations remain blocked. External mount tools can bypass this app's checks.");
                             });
-                            if self.config != old_guard { self.copy_ready=false; self.guard_verified=None; self.setup_generation=self.setup_generation.wrapping_add(1); }
+                            if self.config != old_guard { self.copy_ready=false; self.guard_verified=None; self.pending_copy_check=false; self.pending_guard_check=false; self.setup_generation=self.setup_generation.wrapping_add(1); }
                             ui.add_space(4.0);
                             ui.label(RichText::new("Local image mounting remains available. Connection settings are stored per-user; SSH keys and passwords are not stored here.").color(p.muted).size(12.0));
                         });
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Refresh mapped drives").clicked() { thread::spawn(refresh_mappings); }
-                        if ui.add(primary_action("Save settings", p)).clicked() { match self.config.save() { Ok(()) => self.setup_message="Settings saved. Check the helper before copying.".into(), Err(e) => self.setup_message=e } }
+                        if ui.add(primary_action("Save settings", p)).clicked() { match self.config.save() {
+                            Ok(()) => {
+                                self.pending_copy_check=self.config.copy_configured();
+                                self.pending_guard_check=self.detached && self.disk().is_some() && self.config.delete_configured();
+                                self.setup_message="Settings saved. Helpers will be checked when you close setup.".into();
+                            },
+                            Err(e) => self.setup_message=e
+                        } }
                         if ui.button("Close").clicked() { self.show_settings=false; }
                     });
                 });
@@ -1677,8 +1826,7 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() { self.run_confirm=false; }
-                    let can_start = self.copy_ready && !self.busy && !self.scan_busy && self.loading.is_empty() && self.detached && !self.running
-                        && self.disk().is_some_and(|d| command(&self.config.copy_ssh,&self.config.share,&self.config.guest_root,d,&self.source,&self.destination).is_ok());
+                    let can_start = self.can_start_copy();
                     let start = ui.add_enabled(can_start, primary_action("Start copy",p));
                     let start = if can_start { start } else { start.on_disabled_hover_text("Check the connection, paths, and detached image before copying.") };
                     if start.clicked() {
@@ -1770,6 +1918,126 @@ mod tests {
         }
         assert!(values[2].0 > 0.0 && values[2].0 < 1.0);
         for (palette, slider) in values { assert!((slider - 2.0 * palette).abs() < 0.001); }
+    }
+    fn readiness_test_app() -> App {
+        let config=config::Config {
+            copy_ssh:"user@nas.example".into(), share:r"\\nas.example\share".into(), guest_root:"/srv/share".into(),
+            delete_ssh:"root@nas.example".into(), host_root:"/srv/share".into(), ..Default::default()
+        };
+        let mut app=App::from_config(config, "not checked".into(), false);
+        app.disks.push(Disk { drive:"H:\\".into(), image_path:r"\\nas.example\share\Sample.vhdx".into(), partition:1 });
+        app.selected=Some(0);
+        app.destination=r"\\nas.example\share\destination".into();
+        app.source="example.txt".into();
+        app.source_selected=true;
+        app.pending_copy_check=false;
+        app
+    }
+
+    #[test]
+    fn startup_queues_a_live_check_only_for_a_configured_connection() {
+        let configured=readiness_test_app().config;
+        let app=App::from_config(configured,"not checked".into(),false);
+        assert!(app.pending_copy_check && !app.copy_ready && !app.setup_busy);
+        assert!(app.guard_verified.is_none() && !app.pending_guard_check);
+        assert!(app.rx.try_recv().is_err()); // construction does not start a worker
+        let missing=App::from_config(config::Config::default(),"not configured".into(),true);
+        assert!(!missing.pending_copy_check && !missing.copy_ready && !missing.setup_busy);
+        assert!(missing.guard_verified.is_none() && missing.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn detached_image_check_remains_queued_until_copy_check_and_modal_finish() {
+        let mut app=readiness_test_app();
+        app.setup_generation=5;
+        app.setup_busy=true;
+        app.setup_checking=Some(PendingHelperCheck::Copy);
+        assert!(app.tx.send(Event::Detached(Ok("detached".into()))).is_ok());
+        app.events();
+        assert!(app.detached && app.pending_guard_check);
+        assert!(app.tx.send(Event::HostSetup(5,Ok("ready".into()))).is_ok());
+        app.events();
+        assert!(app.copy_ready && !app.setup_busy && app.pending_guard_check);
+        app.run_confirm=true;
+        app.run_pending_helper_checks(); // must not start a remote check behind the modal
+        assert!(!app.setup_busy && app.pending_guard_check);
+        assert!(app.can_start_copy());
+        app.setup_busy=true;
+        assert!(!app.can_start_copy()); // a confirmation cannot race an in-flight check
+    }
+
+    #[test]
+    fn late_guard_result_during_copy_or_after_configuration_change_is_ignored() {
+        let mut app=readiness_test_app();
+        app.detached=true;
+        app.running=true;
+        app.setup_generation=4;
+        app.generation=9;
+        app.setup_busy=true;
+        let image=app.disk().unwrap().image_path.clone();
+        assert!(app.tx.send(Event::GuardChecked(4,9,image.clone(),Ok(()))).is_ok());
+        app.events();
+        assert!(app.guard_verified.is_none());
+        assert!(app.tx.send(Event::Finished(Err("copy failed".into()))).is_ok());
+        app.events();
+        assert!(app.guard_verified.is_none() && !app.pending_guard_check);
+        app.setup_generation=5; // edited settings or a newer operation
+        assert!(app.tx.send(Event::GuardChecked(4,9,image,Ok(()))).is_ok());
+        app.events();
+        assert!(app.guard_verified.is_none());
+    }
+
+    #[test]
+    fn manual_helper_setup_does_not_run_during_copy_or_deletion() {
+        let mut app=readiness_test_app();
+        app.copy_ready=true;
+        app.setup_message="unchanged".into();
+        app.running=true;
+        app.start_host_setup_inner(true,true);
+        app.start_host_setup_inner(false,true);
+        assert!(app.copy_ready && !app.setup_busy && app.setup_message=="unchanged");
+        app.running=false;
+        app.delete_running=true;
+        app.start_host_setup_inner(true,true);
+        assert!(app.copy_ready && !app.setup_busy && app.setup_message=="unchanged");
+    }
+
+    #[test]
+    fn successful_delete_queues_recheck_but_failed_delete_does_not() {
+        let mut app=readiness_test_app();
+        app.detached=true;
+        let target=delete_ui::DeleteTarget::new(app.disk().unwrap().image_path.clone(),"example.txt".into(),false).unwrap();
+        assert!(app.tx.send(Event::Deleted(app.generation,target.clone(),Ok("done".into()))).is_ok());
+        app.events();
+        assert!(app.pending_guard_check);
+        app.pending_guard_check=false;
+        assert!(app.tx.send(Event::Deleted(app.generation,target,Err("safe hold".into()))).is_ok());
+        app.events();
+        assert!(!app.pending_guard_check);
+    }
+
+    #[test]
+    fn passive_checks_are_serial_and_image_check_is_not_lost() {
+        use PendingHelperCheck::{Copy, Guard};
+        assert_eq!(next_helper_check(true,true,false,true),Some(Copy));
+        assert_eq!(next_helper_check(false,true,true,true),None); // copy still in flight
+        assert_eq!(next_helper_check(false,true,false,false),None); // image is not idle
+        assert_eq!(next_helper_check(false,true,false,true),Some(Guard));
+        assert_eq!(next_helper_check(false,false,false,true),None);
+    }
+    #[test]
+    fn passive_checks_wait_while_the_app_is_busy_or_settings_are_open() {
+        assert_eq!(next_helper_check(true,true,true,true),None);
+        assert_eq!(next_helper_check(false,true,true,true),None);
+    }
+    #[test]
+    fn stale_guard_results_never_verify_a_changed_connection_or_image() {
+        assert!(guard_check_is_current(1,1,2,2,true,"Disk.vhdx",Some("disk.VHDX")));
+        assert!(!guard_check_is_current(1,2,2,2,true,"Disk.vhdx",Some("disk.vhdx")));
+        assert!(!guard_check_is_current(1,1,2,3,true,"Disk.vhdx",Some("disk.vhdx")));
+        assert!(!guard_check_is_current(1,1,2,2,false,"Disk.vhdx",Some("disk.vhdx")));
+        assert!(!guard_check_is_current(1,1,2,2,true,"Disk.vhdx",Some("other.vhdx")));
+        assert!(!guard_check_is_current(1,1,2,2,true,"Disk.vhdx",None));
     }
     #[test]
     fn guard_install_guidance_never_treats_existence_as_verified() {
