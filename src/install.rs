@@ -298,13 +298,19 @@ mod tests {
         assert!(link.is_file());
         let out=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","$w=New-Object -ComObject WScript.Shell; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $w.CreateShortcut($env:TEST_LINK).TargetPath"]).env("TEST_LINK",&link).output().unwrap();
         assert!(out.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            install.join("VHDrop.exe").to_string_lossy()
-        );
+        let actual_target = String::from_utf8_lossy(&out.stdout);
+        let actual_target = fs::canonicalize(actual_target.trim()).expect("shortcut target must exist");
+        let expected_target = fs::canonicalize(install.join("VHDrop.exe")).unwrap();
+        assert!(actual_target.to_string_lossy().eq_ignore_ascii_case(&expected_target.to_string_lossy()),
+            "shortcut target differs: {} vs {}", actual_target.display(), expected_target.display());
         let icon=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","$w=New-Object -ComObject WScript.Shell; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $w.CreateShortcut($env:TEST_LINK).IconLocation"]).env("TEST_LINK",&link).output().unwrap();
         assert!(icon.status.success());
-        assert_eq!(String::from_utf8_lossy(&icon.stdout).trim(), format!("{},0", install.join("VHDrop.exe").display()));
+        let icon_location = String::from_utf8_lossy(&icon.stdout);
+        let (icon_path, icon_index) = icon_location.trim().rsplit_once(',').expect("icon must include an index");
+        assert_eq!(icon_index, "0");
+        let icon_path = fs::canonicalize(icon_path).expect("shortcut icon must exist");
+        assert!(icon_path.to_string_lossy().eq_ignore_ascii_case(&expected_target.to_string_lossy()),
+            "shortcut icon differs: {} vs {}", icon_path.display(), expected_target.display());
         fs::write(&source, b"updated executable").unwrap();
         install_to(&source, &install, &programs).unwrap();
         assert_eq!(
